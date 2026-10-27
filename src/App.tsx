@@ -345,28 +345,26 @@ function Inventory({ cfg }: { cfg: Record<string, any> }) {
   const tasa = cfg.tasa || 350;
 
   const load = useCallback(async () => { 
-    const productos = await dbGetAll<Producto>('productos');
+    let productos = await dbGetAll<Producto>('productos');
     const lotes = await dbGetAll<LoteCompra>('lotesCompra');
     
-    // Migración automática: productos antiguos sin stockTienda/stockAlmacen
-    const necesitaMigracion = productos.some(p => p.stockTienda === undefined || p.stockAlmacen === undefined);
-    if (necesitaMigracion) {
-      for (const p of productos) {
-        if (p.stockTienda === undefined || p.stockAlmacen === undefined) {
-          await dbPut('productos', {
-            ...p,
-            stockTienda: p.stock || 0,
-            stockAlmacen: 0
-          });
-        }
+    // Migración automática: asegurar que todos los productos tengan stockTienda y stockAlmacen
+    let necesitaActualizar = false;
+    for (const p of productos) {
+      if (p.stockTienda === undefined || p.stockAlmacen === undefined) {
+        p.stockTienda = p.stockTienda !== undefined ? p.stockTienda : (p.stock || 0);
+        p.stockAlmacen = p.stockAlmacen !== undefined ? p.stockAlmacen : 0;
+        p.stock = (p.stockTienda || 0) + (p.stockAlmacen || 0);
+        await dbPut('productos', p);
+        necesitaActualizar = true;
       }
-      showToast('Datos migrados correctamente', 'ok');
-      const productosActualizados = await dbGetAll<Producto>('productos');
-      setProductos(productosActualizados);
-    } else {
-      setProductos(productos);
     }
     
+    if (necesitaActualizar) {
+      productos = await dbGetAll<Producto>('productos');
+    }
+    
+    setProductos(productos);
     setLotes(lotes);
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -1607,8 +1605,59 @@ function Clients({ cfg }: { cfg: Record<string, any> }) {
 
   const registrarAbono = async () => {
     if (!abonoModal || (abonoCUP <= 0 && abonoUSD <= 0)) { showToast('Monto inválido', 'err'); return; }
-    await dbPut('clientes', { ...abonoModal, saldoCUP: Math.max(0, abonoModal.saldoCUP - abonoCUP), saldoUSD: Math.max(0, abonoModal.saldoUSD - abonoUSD) });
-    showToast('Abono registrado', 'ok'); setAbonoModal(null); setAbonoCUP(0); setAbonoUSD(0); load();
+    
+    // Actualizar saldo del cliente
+    await dbPut('clientes', { 
+      ...abonoModal, 
+      saldoCUP: Math.max(0, abonoModal.saldoCUP - abonoCUP), 
+      saldoUSD: Math.max(0, abonoModal.saldoUSD - abonoUSD) 
+    });
+    
+    // Actualizar cierre diario del día (el abono entra a caja)
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const fechaHoy = hoy.getTime();
+    
+    const cierresDiarios = await dbGetAll<CierreDiario>('cierresDiarios');
+    let cierreHoy = cierresDiarios.find(c => c.fecha === fechaHoy);
+    
+    if (cierreHoy) {
+      // Actualizar cierre existente
+      cierreHoy.cajaCUP += abonoCUP;
+      cierreHoy.cajaUSD += abonoUSD;
+      cierreHoy.efectivoCUP += abonoCUP;
+      cierreHoy.efectivoUSD += abonoUSD;
+      await dbPut('cierresDiarios', cierreHoy);
+    } else {
+      // Crear nuevo cierre diario solo con el abono
+      const nuevoCierre: CierreDiario = {
+        fecha: fechaHoy,
+        ventasIds: [],
+        totalVentasCUP: 0,
+        totalVentasUSD: 0,
+        costoVentasCUP: 0,
+        costoVentasUSD: 0,
+        gananciaBrutaCUP: 0,
+        gananciaBrutaUSD: 0,
+        cajaCUP: abonoCUP,
+        cajaUSD: abonoUSD,
+        efectivoCUP: abonoCUP,
+        efectivoUSD: abonoUSD,
+        transferenciaCUP: 0,
+        transferenciaUSD: 0,
+        creditoCUP: 0,
+        creditoUSD: 0,
+        tasaUsada: tasa,
+        creado: Date.now()
+      };
+      await dbAdd('cierresDiarios', nuevoCierre);
+    }
+    
+    showToast('Abono registrado y actualizado en caja', 'ok'); 
+    setAbonoModal(null); 
+    setAbonoCUP(0); 
+    setAbonoUSD(0); 
+    load();
   };
 
   const conSaldo = clientes.filter(c => c.saldoCUP > 0 || c.saldoUSD > 0);
